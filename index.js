@@ -35,70 +35,53 @@ function isOriginAllowed(origin) {
 function buildUpstreamHeaders(req, url, headersParam) {
     const headers = {
         "User-Agent": CONFIG.DEFAULT_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Upgrade-Insecure-Requests": "1"
+        "Connection": "keep-alive"
     };
 
+    // Forward allowed client headers
     CONFIG.FORWARD_HEADERS.forEach(h => {
-        if (req.headers[h]) headers[h] = req.headers[h];
+        if (req.headers[h]) {
+            headers[h] = req.headers[h];
+        }
     });
 
-    let referer = CONFIG.DEFAULT_REFERER;
+    // Apply source headers exactly as provided
     if (headersParam) {
         try {
-            const additionalHeaders = JSON.parse(headersParam);
-            Object.entries(additionalHeaders).forEach(([key, value]) => {
-                const lk = key.toLowerCase();
-                headers[lk] = value;
-                if (lk === 'referer' || lk === 'referrer') referer = value;
-            });
-        } catch (e) { }
-    }
+            const customHeaders =
+                typeof headersParam === "string"
+                    ? JSON.parse(headersParam)
+                    : headersParam;
 
-    if (referer) {
-        let refStr = decodeURIComponent(referer);
-
-        if (url.hostname.includes('kwik') || url.hostname.includes('kwics')) {
-            refStr = CONFIG.ANIMEPAHE_BASE;
-            if (!refStr.endsWith('/')) refStr += '/';
-        } else if (url.hostname.includes('owocdn') || url.hostname.includes('cdn')) {
-            if (!refStr.includes('kwik.cx')) {
-                refStr = CONFIG.DEFAULT_REFERER;
+            for (const [key, value] of Object.entries(customHeaders)) {
+                headers[key] = value;
             }
+        } catch (err) {
+            console.error("Invalid headers JSON:", err);
         }
+    }
 
-        if (refStr.includes('kwik.cx') && !refStr.endsWith('/')) {
-            refStr += '/';
-        }
-        headers['referer'] = refStr;
+    // Auto-generate origin if referer exists but origin missing
+    const referer =
+        headers.Referer ||
+        headers.referer ||
+        headers.Referrer ||
+        headers.referrer;
 
+    if (referer && !headers.Origin && !headers.origin) {
         try {
-            headers['origin'] = new URL(refStr).origin;
-        } catch (e) {
-            headers['origin'] = refStr;
-        }
+            headers.Origin = new URL(referer).origin;
+        } catch {}
     }
 
-    if (url.hostname.includes('owocdn')) {
-        headers['Sec-Fetch-Dest'] = 'iframe';
-        headers['Sec-Fetch-Mode'] = 'navigate';
-        headers['Sec-Fetch-Site'] = 'cross-site';
-    } else {
-        headers['Sec-Fetch-Dest'] = 'empty';
-        headers['Sec-Fetch-Mode'] = 'cors';
-        headers['Sec-Fetch-Site'] = 'cross-site';
-    }
-
+    // Reuse cookies
     const storedCookies = cookieJar.get(url.hostname);
     if (storedCookies) {
-        headers['cookie'] = headers['cookie']
-            ? `${headers['cookie']}; ${storedCookies}`
+        headers.Cookie = headers.Cookie
+            ? `${headers.Cookie}; ${storedCookies}`
             : storedCookies;
     }
 
