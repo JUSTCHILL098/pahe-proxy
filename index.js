@@ -1,4 +1,4 @@
-import express from 'express';
+=import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
@@ -35,53 +35,71 @@ function isOriginAllowed(origin) {
 function buildUpstreamHeaders(req, url, headersParam) {
     const headers = {
         "User-Agent": CONFIG.DEFAULT_USER_AGENT,
-        "Accept": "*/*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1"
     };
 
-    // Forward allowed client headers
     CONFIG.FORWARD_HEADERS.forEach(h => {
-        if (req.headers[h]) {
-            headers[h] = req.headers[h];
-        }
+        if (req.headers[h]) headers[h] = req.headers[h];
     });
 
-    // Apply source headers exactly as provided
+    let referer = CONFIG.DEFAULT_REFERER;
     if (headersParam) {
         try {
-            const customHeaders =
-                typeof headersParam === "string"
-                    ? JSON.parse(headersParam)
-                    : headersParam;
+            const additionalHeaders = JSON.parse(headersParam);
+            Object.entries(additionalHeaders).forEach(([key, value]) => {
+                const lk = key.toLowerCase();
+                headers[lk] = value;
+                if (lk === 'referer' || lk === 'referrer') referer = value;
+            });
+        } catch (e) { }
+    }
 
-            for (const [key, value] of Object.entries(customHeaders)) {
-                headers[key] = value;
+    if (referer) {
+        let refStr = decodeURIComponent(referer);
+
+        // Dynamic referer logic based on target URL
+        if (url.hostname.includes('kwik') || url.hostname.includes('kwics')) {
+            refStr = CONFIG.ANIMEPAHE_BASE;
+            if (!refStr.endsWith('/')) refStr += '/';
+        } else if (url.hostname.includes('owocdn') || url.hostname.includes('cdn')) {
+            if (!refStr.includes('kwik.cx')) {
+                refStr = CONFIG.DEFAULT_REFERER;
             }
-        } catch (err) {
-            console.error("Invalid headers JSON:", err);
+        }
+
+        if (refStr.includes('kwik.cx') && !refStr.endsWith('/')) {
+            refStr += '/';
+        }
+        headers['referer'] = refStr;
+
+        try {
+            headers['origin'] = new URL(refStr).origin;
+        } catch (e) {
+            headers['origin'] = refStr;
         }
     }
 
-    // Auto-generate origin if referer exists but origin missing
-    const referer =
-        headers.Referer ||
-        headers.referer ||
-        headers.Referrer ||
-        headers.referrer;
-
-    if (referer && !headers.Origin && !headers.origin) {
-        try {
-            headers.Origin = new URL(referer).origin;
-        } catch {}
+    if (url.hostname.includes('owocdn')) {
+        headers['Sec-Fetch-Dest'] = 'iframe';
+        headers['Sec-Fetch-Mode'] = 'navigate';
+        headers['Sec-Fetch-Site'] = 'cross-site';
+    } else {
+        headers['Sec-Fetch-Dest'] = 'empty';
+        headers['Sec-Fetch-Mode'] = 'cors';
+        headers['Sec-Fetch-Site'] = 'cross-site';
     }
 
-    // Reuse cookies
     const storedCookies = cookieJar.get(url.hostname);
     if (storedCookies) {
-        headers.Cookie = headers.Cookie
-            ? `${headers.Cookie}; ${storedCookies}`
+        headers['cookie'] = headers['cookie']
+            ? `${headers['cookie']}; ${storedCookies}`
             : storedCookies;
     }
 
@@ -239,127 +257,6 @@ app.get("/m3u8-proxy", async (req, res) => {
         if (!res.headersSent) {
             safeSend(500, { message: e.message });
         }
-    }
-});
-
-app.get("/subs-proxy", async (req, res) => {
-    const safeSend = createSafeSender(res);
-    const origin = req.headers.origin || "";
-
-    if (!isOriginAllowed(origin)) {
-        return safeSend(403, `The origin "${origin}" was blacklisted.`);
-    }
-
-    try {
-        const urlStr = req.query.url;
-        if (!urlStr) return safeSend(400, { message: "URL is required" });
-
-        const url = new URL(urlStr);
-        const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
-        const headers = buildUpstreamHeaders(req, url, headersParam);
-
-        const options = {
-            method: 'GET',
-            url: url.href,
-            headers: headers,
-            encoding: null,
-            resolveWithFullResponse: true,
-            timeout: 15000
-        };
-
-        const targetResponse = await cloudscraper(options);
-        updateCookieJar(url, targetResponse);
-        setCorsHeaders(req, res);
-
-        res.setHeader('Content-Type', 'text/vtt');
-        res.status(targetResponse.statusCode).send(targetResponse.body);
-
-    } catch (err) {
-        console.error("Subs Proxy Error:", err.message);
-        safeSend(err.response?.statusCode || 500, { error: err.message });
-    }
-});
-
-app.get("/thumbnails-proxy", async (req, res) => {
-    const safeSend = createSafeSender(res);
-    try {
-        const urlStr = req.query.url;
-        if (!urlStr) return safeSend(400, { message: "URL is required" });
-
-        const url = new URL(urlStr);
-        const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
-        const headers = buildUpstreamHeaders(req, url, headersParam);
-
-        const targetResponse = await cloudscraper({
-            url: url.href,
-            method: 'GET',
-            headers: headers,
-            encoding: null,
-            resolveWithFullResponse: true,
-            timeout: 15000
-        });
-
-        updateCookieJar(url, targetResponse);
-        setCorsHeaders(req, res);
-
-        let content = targetResponse.body.toString('utf8');
-        const lines = content.split('\n').map(line => {
-            const trimmed = line.trim();
-            if (trimmed && !trimmed.startsWith('WEBVTT') && !trimmed.includes('-->')) {
-                try {
-                    const [urlPart, hashPart] = trimmed.split('#');
-                    const absUrl = new URL(urlPart, url.href).href;
-                    
-                    let proxyUrl = `/image-segments-proxy?url=${encodeURIComponent(absUrl)}`;
-                    if (headersParam) proxyUrl += `&headers=${encodeURIComponent(headersParam)}`;
-                    
-                    return hashPart ? `${proxyUrl}#${hashPart}` : proxyUrl;
-                } catch (e) { return line; }
-            }
-            return line;
-        });
-
-        res.setHeader('Content-Type', 'text/vtt');
-        res.status(200).send(lines.join('\n'));
-
-    } catch (err) {
-        console.error("Thumbnails VTT Error:", err.message);
-        safeSend(err.response?.statusCode || 500, { error: err.message });
-    }
-});
-
-app.get("/image-segments-proxy", async (req, res) => {
-    const safeSend = createSafeSender(res);
-    try {
-        const urlStr = req.query.url;
-        if (!urlStr) return safeSend(400, { message: "URL is required" });
-
-        const url = new URL(urlStr);
-        const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
-        const headers = buildUpstreamHeaders(req, url, headersParam);
-
-        const targetResponse = await cloudscraper({
-            url: url.href,
-            method: 'GET',
-            headers: headers,
-            encoding: null,
-            resolveWithFullResponse: true,
-            timeout: 20000
-        });
-
-        updateCookieJar(url, targetResponse);
-        setCorsHeaders(req, res);
-
-        const contentType = targetResponse.headers['content-type'];
-        if (contentType) res.setHeader('Content-Type', contentType);
-        
-        res.setHeader('Cache-Control', 'public, max-age=3600');
-
-        res.status(targetResponse.statusCode).send(targetResponse.body);
-
-    } catch (err) {
-        console.error("Image Segment Error:", err.message);
-        safeSend(err.response?.statusCode || 500, { error: err.message });
     }
 });
 
