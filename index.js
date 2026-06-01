@@ -35,7 +35,7 @@ function isOriginAllowed(origin) {
 function buildUpstreamHeaders(req, url, headersParam) {
     const headers = {
         "User-Agent": CONFIG.DEFAULT_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept": "*/*", // Changed from text/html to catch all image/video segments
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
@@ -45,7 +45,7 @@ function buildUpstreamHeaders(req, url, headersParam) {
         "Upgrade-Insecure-Requests": "1"
     };
 
-    // FIX: Explicitly forward Range header if present to support seeking
+    // Forward Range header to upstream for seeking/scrubbing support
     if (req.headers.range) {
         headers['range'] = req.headers.range;
     }
@@ -69,7 +69,6 @@ function buildUpstreamHeaders(req, url, headersParam) {
     if (referer) {
         let refStr = decodeURIComponent(referer);
 
-        // Dynamic referer logic based on target URL
         if (url.hostname.includes('kwik') || url.hostname.includes('kwics')) {
             refStr = CONFIG.ANIMEPAHE_BASE;
             if (!refStr.endsWith('/')) refStr += '/';
@@ -208,7 +207,9 @@ app.get("/m3u8-proxy", async (req, res) => {
             req.headers.range
         );
 
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = url.pathname.endsWith(".mp4") ? "0" : "1";
+        // FIX: Reject unauthorized disabled if it's an MP4 OR an owocdn segment asset masquerading as a .jpg
+        const isMediaSegment = url.pathname.endsWith(".mp4") || url.pathname.includes("segment-") || url.hostname.includes("owocdn");
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = isMediaSegment ? "0" : "1";
 
         const options = {
             method: 'GET',
@@ -245,7 +246,8 @@ app.get("/m3u8-proxy", async (req, res) => {
                     });
                 }
 
-                // FIX: Dynamically maps range headers back to player to allow successful seeking
+                // FIX: Ensure range and video stream tracking structures pass back flawlessly 
+                // even when the upstream content type claims to be an image ('image/jpeg')
                 const streamHeaders = [
                     'content-type',
                     'content-length',
@@ -260,7 +262,11 @@ app.get("/m3u8-proxy", async (req, res) => {
                     }
                 });
 
-                // Set status directly from upstream status (will be 206 for partial seeks)
+                // Force video stream mapping headers if we detect an owocdn segment 
+                if (url.pathname.includes("segment-") && !targetResponse.headers['accept-ranges']) {
+                    res.setHeader('Accept-Ranges', 'bytes');
+                }
+
                 res.writeHead(targetResponse.statusCode);
                 res.end(targetResponse.body);
             }
