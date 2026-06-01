@@ -10,7 +10,8 @@ const cloudscraper = require('cloudscraper');
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const cookieJar = new Map();
+
+// REMOVED stateful cookieJar Map to ensure absolute stateless Serverless capability on Vercel
 
 function createSafeSender(res) {
     let sent = false;
@@ -35,8 +36,8 @@ function isOriginAllowed(origin) {
 function buildUpstreamHeaders(req, url, headersParam) {
     const headers = {
         "User-Agent": CONFIG.DEFAULT_USER_AGENT,
-        "Accept": "*/*", // Changed from text/html to catch all image/video segments
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
@@ -45,7 +46,7 @@ function buildUpstreamHeaders(req, url, headersParam) {
         "Upgrade-Insecure-Requests": "1"
     };
 
-    // Forward Range header to upstream for seeking/scrubbing support
+    // Forward player range request directly
     if (req.headers.range) {
         headers['range'] = req.headers.range;
     }
@@ -55,6 +56,8 @@ function buildUpstreamHeaders(req, url, headersParam) {
     });
 
     let referer = CONFIG.DEFAULT_REFERER;
+    
+    // Serverless Fix: Parse passed cookies / headers from query pipeline parameters dynamically
     if (headersParam) {
         try {
             const additionalHeaders = JSON.parse(headersParam);
@@ -91,8 +94,8 @@ function buildUpstreamHeaders(req, url, headersParam) {
     }
 
     if (url.hostname.includes('owocdn')) {
-        headers['Sec-Fetch-Dest'] = 'iframe';
-        headers['Sec-Fetch-Mode'] = 'navigate';
+        headers['Sec-Fetch-Dest'] = 'video';
+        headers['Sec-Fetch-Mode'] = 'cors';
         headers['Sec-Fetch-Site'] = 'cross-site';
     } else {
         headers['Sec-Fetch-Dest'] = 'empty';
@@ -100,42 +103,17 @@ function buildUpstreamHeaders(req, url, headersParam) {
         headers['Sec-Fetch-Site'] = 'cross-site';
     }
 
-    const storedCookies = cookieJar.get(url.hostname);
-    if (storedCookies) {
-        headers['cookie'] = headers['cookie']
-            ? `${headers['cookie']}; ${storedCookies}`
-            : storedCookies;
-    }
-
     return headers;
-}
-
-function updateCookieJar(url, targetResponse) {
-    const setCookie = targetResponse.headers['set-cookie'];
-    if (setCookie) {
-        const current = cookieJar.get(url.hostname) || "";
-        const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
-
-        const merged = [...new Set([
-            ...current.split('; '),
-            ...cookies.map(c => c.split(';')[0])
-        ])].filter(Boolean).join('; ');
-
-        cookieJar.set(url.hostname, merged);
-    }
 }
 
 function setCorsHeaders(req, res) {
     const origin = req.headers.origin || '*';
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Methods', CONFIG.CORS.ALLOW_METHODS);
-    res.setHeader('Access-Control-Allow-Headers', CONFIG.CORS.ALLOW_HEADERS);
-    res.setHeader('Access-Control-Expose-Headers', CONFIG.CORS.EXPOSE_HEADERS);
+    res.setHeader('Access-Control-Allow-Headers', CONFIG.CORS.ALLOW_HEADERS || '*');
+    res.setHeader('Access-Control-Expose-Headers', CONFIG.CORS.EXPOSE_HEADERS || '*');
     res.setHeader('Access-Control-Allow-Credentials', CONFIG.CORS.ALLOW_CREDENTIALS);
-    res.setHeader('Cache-Control', CONFIG.CACHE_CONTROL);
-    res.setHeader('Pragma', 'no-cache');
-    res.setHeader('Expires', '0');
-    res.setHeader('X-Proxy-By', 'm3u8-proxy');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, private');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 }
 
@@ -200,16 +178,7 @@ app.get("/m3u8-proxy", async (req, res) => {
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
         const headers = buildUpstreamHeaders(req, url, headersParam);
 
-        console.log(
-            "[PROXY]",
-            url.href,
-            "Range:",
-            req.headers.range
-        );
-
-        // FIX: Reject unauthorized disabled if it's an MP4 OR an owocdn segment asset masquerading as a .jpg
-        const isMediaSegment = url.pathname.endsWith(".mp4") || url.pathname.includes("segment-") || url.hostname.includes("owocdn");
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = isMediaSegment ? "0" : "1";
+        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
         const options = {
             method: 'GET',
@@ -217,14 +186,33 @@ app.get("/m3u8-proxy", async (req, res) => {
             headers: headers,
             encoding: null,
             resolveWithFullResponse: true,
-            timeout: 20000
+            timeout: 25000
         };
 
         try {
             const targetResponse = await cloudscraper(options);
-
-            updateCookieJar(url, targetResponse);
             setCorsHeaders(req, res);
+
+            // Serverless Fix: Extract session cookies returned by this exact segment execution loop
+            // and package them forward safely inside structural references
+            let incomingCookies = "";
+            const setCookie = targetResponse.headers['set-cookie'];
+            if (setCookie) {
+                const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
+                incomingCookies = cookies.map(c => c.split(';')[0]).join('; ');
+            }
+
+            // Append captured context to subsequent fragments
+            let nextHeadersParam = headersParam;
+            if (incomingCookies) {
+                try {
+                    const currentObj = headersParam ? JSON.parse(headersParam) : {};
+                    currentObj['cookie'] = currentObj['cookie'] 
+                        ? `${currentObj['cookie']}; ${incomingCookies}` 
+                        : incomingCookies;
+                    nextHeadersParam = JSON.stringify(currentObj);
+                } catch(e) {}
+            }
 
             const contentType = targetResponse.headers['content-type'] || '';
             const isPlaylist = url.pathname.toLowerCase().endsWith(".m3u8") ||
@@ -233,21 +221,17 @@ app.get("/m3u8-proxy", async (req, res) => {
 
             if (isPlaylist) {
                 const content = targetResponse.body.toString('utf8');
-                const proxiedContent = proxyPlaylistContent(content, url, headersParam);
+                const proxiedContent = proxyPlaylistContent(content, url, nextHeadersParam);
                 res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
                 res.status(200).send(proxiedContent);
             } else {
                 if (targetResponse.statusCode >= 400) {
-                    const bodyStr = targetResponse.body.toString('utf8');
                     return safeSend(targetResponse.statusCode, {
                         message: "Upstream returned error",
-                        upstreamStatus: targetResponse.statusCode,
-                        body: bodyStr.substring(0, 1000)
+                        upstreamStatus: targetResponse.statusCode
                     });
                 }
 
-                // FIX: Ensure range and video stream tracking structures pass back flawlessly 
-                // even when the upstream content type claims to be an image ('image/jpeg')
                 const streamHeaders = [
                     'content-type',
                     'content-length',
@@ -257,13 +241,12 @@ app.get("/m3u8-proxy", async (req, res) => {
 
                 Object.entries(targetResponse.headers).forEach(([k, v]) => {
                     const lk = k.toLowerCase();
-                    if (CONFIG.UPSTREAM_HEADERS.includes(lk) || streamHeaders.includes(lk)) {
+                    if (streamHeaders.includes(lk)) {
                         res.setHeader(k, v);
                     }
                 });
 
-                // Force video stream mapping headers if we detect an owocdn segment 
-                if (url.pathname.includes("segment-") && !targetResponse.headers['accept-ranges']) {
+                if (!targetResponse.headers['accept-ranges']) {
                     res.setHeader('Accept-Ranges', 'bytes');
                 }
 
@@ -272,10 +255,9 @@ app.get("/m3u8-proxy", async (req, res) => {
             }
 
         } catch (err) {
-            console.error("Cloudscraper error:", err.message);
             if (err.response) {
                 return safeSend(err.response.statusCode || 502, {
-                    message: "Upstream error (Cloudscraper)",
+                    message: "Upstream connection timed out/failed",
                     error: err.message
                 });
             }
