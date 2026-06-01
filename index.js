@@ -1,8 +1,12 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 import https from 'https';
 import { CONFIG } from './config.js';
+
+const require = createRequire(import.meta.url);
+const cloudscraper = require('cloudscraper');
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -29,12 +33,19 @@ function isOriginAllowed(origin) {
 }
 
 function buildUpstreamHeaders(req, url, headersParam) {
+    // High-fidelity browser emulation headers to prevent 403 Forbidden responses
     const headers = {
-        "User-Agent": CONFIG.DEFAULT_USER_AGENT,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
-        "Accept-Encoding": "identity", // Force raw stream chunking without double gzipping
-        "Connection": "keep-alive"
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity", 
+        "Connection": "keep-alive",
+        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site"
     };
 
     if (req.headers.range) {
@@ -154,25 +165,43 @@ app.get("/m3u8-proxy", async (req, res) => {
 
         const isPlaylist = url.pathname.toLowerCase().endsWith(".m3u8");
 
-        // PLAYLIST PROCESSING (Reads text configuration)
         if (isPlaylist) {
-            https.get(url.href, { headers, rejectUnauthorized: false }, (targetResponse) => {
-                let data = [];
-                targetResponse.on('data', chunk => data.push(chunk));
-                targetResponse.on('end', () => {
-                    const buffer = Buffer.concat(data);
-                    const content = buffer.toString('utf8');
-                    const proxiedContent = proxyPlaylistContent(content, url, headersParam);
-                    res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
-                    res.status(200).send(proxiedContent);
-                });
-            }).on('error', (err) => safeSend(500, { message: err.message }));
+            // Use Cloudscraper for .m3u8 to clear Cloudflare/Anti-Bot walls easily
+            const options = {
+                method: 'GET',
+                url: url.href,
+                headers: headers,
+                encoding: null,
+                resolveWithFullResponse: true,
+                timeout: 15000
+            };
+
+            try {
+                const targetResponse = await cloudscraper(options);
+                const content = targetResponse.body.toString('utf8');
+                const proxiedContent = proxyPlaylistContent(content, url, headersParam);
+                res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
+                res.status(200).send(proxiedContent);
+            } catch (err) {
+                return safeSend(502, { message: "Failed parsing playlist", error: err.message });
+            }
             
         } else {
-            // FIXED: MEDIA SEGMENT STREAMING (Bypasses Vercel 4.5MB Buffering Cap completely)
-            const proxyRequest = https.get(url.href, { headers, rejectUnauthorized: false }, (targetResponse) => {
+            // Stream the media segments to bypass Vercel's 4.5MB limit
+            // Inject precise browser security parameters to completely clear 403 blocks
+            const proxyRequest = https.get(url.href, { 
+                headers, 
+                rejectUnauthorized: false 
+            }, (targetResponse) => {
+                
+                if (targetResponse.statusCode === 403) {
+                    console.error("[403 Forbidden Detected]: Upstream rejected segment request.");
+                }
+
                 if (targetResponse.statusCode >= 400) {
-                    return safeSend(targetResponse.statusCode, { message: "Upstream streaming error" });
+                    return safeSend(targetResponse.statusCode, { 
+                        message: `Upstream error status: ${targetResponse.statusCode}` 
+                    });
                 }
 
                 const streamHeaders = [
@@ -194,8 +223,6 @@ app.get("/m3u8-proxy", async (req, res) => {
                 }
 
                 res.writeHead(targetResponse.statusCode);
-                
-                // Pipeline stream piping data directly to client as it arrives from the source
                 targetResponse.pipe(res);
             });
 
