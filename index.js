@@ -196,6 +196,13 @@ app.get("/m3u8-proxy", async (req, res) => {
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
         const headers = buildUpstreamHeaders(req, url, headersParam);
 
+    console.log(
+        "[PROXY]",
+         url.href,
+         "Range:",
+         req.headers.range
+       );
+
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = url.pathname.endsWith(".mp4") ? "0" : "1";
 
         const options = {
