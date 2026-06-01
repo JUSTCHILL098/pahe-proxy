@@ -45,6 +45,11 @@ function buildUpstreamHeaders(req, url, headersParam) {
         "Upgrade-Insecure-Requests": "1"
     };
 
+    // FIX: Explicitly forward Range header if present to support seeking
+    if (req.headers.range) {
+        headers['range'] = req.headers.range;
+    }
+
     CONFIG.FORWARD_HEADERS.forEach(h => {
         if (req.headers[h]) headers[h] = req.headers[h];
     });
@@ -196,12 +201,12 @@ app.get("/m3u8-proxy", async (req, res) => {
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
         const headers = buildUpstreamHeaders(req, url, headersParam);
 
-    console.log(
-        "[PROXY]",
-         url.href,
-         "Range:",
-         req.headers.range
-       );
+        console.log(
+            "[PROXY]",
+            url.href,
+            "Range:",
+            req.headers.range
+        );
 
         process.env.NODE_TLS_REJECT_UNAUTHORIZED = url.pathname.endsWith(".mp4") ? "0" : "1";
 
@@ -213,6 +218,7 @@ app.get("/m3u8-proxy", async (req, res) => {
             resolveWithFullResponse: true,
             timeout: 20000
         };
+
         try {
             const targetResponse = await cloudscraper(options);
 
@@ -239,12 +245,22 @@ app.get("/m3u8-proxy", async (req, res) => {
                     });
                 }
 
+                // FIX: Dynamically maps range headers back to player to allow successful seeking
+                const streamHeaders = [
+                    'content-type',
+                    'content-length',
+                    'content-range',
+                    'accept-ranges'
+                ];
+
                 Object.entries(targetResponse.headers).forEach(([k, v]) => {
-                    if (CONFIG.UPSTREAM_HEADERS.includes(k.toLowerCase())) {
+                    const lk = k.toLowerCase();
+                    if (CONFIG.UPSTREAM_HEADERS.includes(lk) || streamHeaders.includes(lk)) {
                         res.setHeader(k, v);
                     }
                 });
 
+                // Set status directly from upstream status (will be 206 for partial seeks)
                 res.writeHead(targetResponse.statusCode);
                 res.end(targetResponse.body);
             }
