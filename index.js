@@ -1,17 +1,12 @@
 import express from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createRequire } from 'module';
+import https from 'https';
 import { CONFIG } from './config.js';
-
-const require = createRequire(import.meta.url);
-const cloudscraper = require('cloudscraper');
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// REMOVED stateful cookieJar Map to ensure absolute stateless Serverless capability on Vercel
 
 function createSafeSender(res) {
     let sent = false;
@@ -38,15 +33,10 @@ function buildUpstreamHeaders(req, url, headersParam) {
         "User-Agent": CONFIG.DEFAULT_USER_AGENT,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Upgrade-Insecure-Requests": "1"
+        "Accept-Encoding": "identity", // Force raw stream chunking without double gzipping
+        "Connection": "keep-alive"
     };
 
-    // Forward player range request directly
     if (req.headers.range) {
         headers['range'] = req.headers.range;
     }
@@ -56,8 +46,6 @@ function buildUpstreamHeaders(req, url, headersParam) {
     });
 
     let referer = CONFIG.DEFAULT_REFERER;
-    
-    // Serverless Fix: Parse passed cookies / headers from query pipeline parameters dynamically
     if (headersParam) {
         try {
             const additionalHeaders = JSON.parse(headersParam);
@@ -71,7 +59,6 @@ function buildUpstreamHeaders(req, url, headersParam) {
 
     if (referer) {
         let refStr = decodeURIComponent(referer);
-
         if (url.hostname.includes('kwik') || url.hostname.includes('kwics')) {
             refStr = CONFIG.ANIMEPAHE_BASE;
             if (!refStr.endsWith('/')) refStr += '/';
@@ -80,27 +67,15 @@ function buildUpstreamHeaders(req, url, headersParam) {
                 refStr = CONFIG.DEFAULT_REFERER;
             }
         }
-
         if (refStr.includes('kwik.cx') && !refStr.endsWith('/')) {
             refStr += '/';
         }
         headers['referer'] = refStr;
-
         try {
             headers['origin'] = new URL(refStr).origin;
         } catch (e) {
             headers['origin'] = refStr;
         }
-    }
-
-    if (url.hostname.includes('owocdn')) {
-        headers['Sec-Fetch-Dest'] = 'video';
-        headers['Sec-Fetch-Mode'] = 'cors';
-        headers['Sec-Fetch-Site'] = 'cross-site';
-    } else {
-        headers['Sec-Fetch-Dest'] = 'empty';
-        headers['Sec-Fetch-Mode'] = 'cors';
-        headers['Sec-Fetch-Site'] = 'cross-site';
     }
 
     return headers;
@@ -126,11 +101,9 @@ function generateProxyUrl(targetUrl, headersParam) {
 function proxyPlaylistContent(content, url, headersParam) {
     return content.split("\n").map((line) => {
         const trimmed = line.trim();
-
         if (trimmed === '' || trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-VERSION")) {
             return line;
         }
-
         if (trimmed.startsWith("#")) {
             return line.replace(/(URI\s*=\s*")([^"]+)(")/gi, (match, prefix, uri, suffix) => {
                 try {
@@ -141,7 +114,6 @@ function proxyPlaylistContent(content, url, headersParam) {
                 }
             });
         }
-
         try {
             const abs = new URL(trimmed, url.href).href;
             return generateProxyUrl(abs, headersParam);
@@ -178,58 +150,29 @@ app.get("/m3u8-proxy", async (req, res) => {
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
         const headers = buildUpstreamHeaders(req, url, headersParam);
 
-        process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+        setCorsHeaders(req, res);
 
-        const options = {
-            method: 'GET',
-            url: url.href,
-            headers: headers,
-            encoding: null,
-            resolveWithFullResponse: true,
-            timeout: 25000
-        };
+        const isPlaylist = url.pathname.toLowerCase().endsWith(".m3u8");
 
-        try {
-            const targetResponse = await cloudscraper(options);
-            setCorsHeaders(req, res);
-
-            // Serverless Fix: Extract session cookies returned by this exact segment execution loop
-            // and package them forward safely inside structural references
-            let incomingCookies = "";
-            const setCookie = targetResponse.headers['set-cookie'];
-            if (setCookie) {
-                const cookies = Array.isArray(setCookie) ? setCookie : [setCookie];
-                incomingCookies = cookies.map(c => c.split(';')[0]).join('; ');
-            }
-
-            // Append captured context to subsequent fragments
-            let nextHeadersParam = headersParam;
-            if (incomingCookies) {
-                try {
-                    const currentObj = headersParam ? JSON.parse(headersParam) : {};
-                    currentObj['cookie'] = currentObj['cookie'] 
-                        ? `${currentObj['cookie']}; ${incomingCookies}` 
-                        : incomingCookies;
-                    nextHeadersParam = JSON.stringify(currentObj);
-                } catch(e) {}
-            }
-
-            const contentType = targetResponse.headers['content-type'] || '';
-            const isPlaylist = url.pathname.toLowerCase().endsWith(".m3u8") ||
-                contentType.includes("mpegURL") ||
-                contentType.includes("application/x-mpegurl");
-
-            if (isPlaylist) {
-                const content = targetResponse.body.toString('utf8');
-                const proxiedContent = proxyPlaylistContent(content, url, nextHeadersParam);
-                res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
-                res.status(200).send(proxiedContent);
-            } else {
+        // PLAYLIST PROCESSING (Reads text configuration)
+        if (isPlaylist) {
+            https.get(url.href, { headers, rejectUnauthorized: false }, (targetResponse) => {
+                let data = [];
+                targetResponse.on('data', chunk => data.push(chunk));
+                targetResponse.on('end', () => {
+                    const buffer = Buffer.concat(data);
+                    const content = buffer.toString('utf8');
+                    const proxiedContent = proxyPlaylistContent(content, url, headersParam);
+                    res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
+                    res.status(200).send(proxiedContent);
+                });
+            }).on('error', (err) => safeSend(500, { message: err.message }));
+            
+        } else {
+            // FIXED: MEDIA SEGMENT STREAMING (Bypasses Vercel 4.5MB Buffering Cap completely)
+            const proxyRequest = https.get(url.href, { headers, rejectUnauthorized: false }, (targetResponse) => {
                 if (targetResponse.statusCode >= 400) {
-                    return safeSend(targetResponse.statusCode, {
-                        message: "Upstream returned error",
-                        upstreamStatus: targetResponse.statusCode
-                    });
+                    return safeSend(targetResponse.statusCode, { message: "Upstream streaming error" });
                 }
 
                 const streamHeaders = [
@@ -251,17 +194,14 @@ app.get("/m3u8-proxy", async (req, res) => {
                 }
 
                 res.writeHead(targetResponse.statusCode);
-                res.end(targetResponse.body);
-            }
+                
+                // Pipeline stream piping data directly to client as it arrives from the source
+                targetResponse.pipe(res);
+            });
 
-        } catch (err) {
-            if (err.response) {
-                return safeSend(err.response.statusCode || 502, {
-                    message: "Upstream connection timed out/failed",
-                    error: err.message
-                });
-            }
-            return safeSend(500, { message: err.message });
+            proxyRequest.on('error', (err) => {
+                if (!res.headersSent) safeSend(502, { message: err.message });
+            });
         }
 
     } catch (e) {
