@@ -32,20 +32,13 @@ function isOriginAllowed(origin) {
     return true;
 }
 
-function buildUpstreamHeaders(req, url, headersParam) {
-    // High-fidelity browser emulation headers to prevent 403 Forbidden responses
+function buildUpstreamHeaders(req, url, headersParam, passedCookies) {
     const headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity", 
-        "Connection": "keep-alive",
-        "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site"
+        "Connection": "keep-alive"
     };
 
     if (req.headers.range) {
@@ -89,6 +82,13 @@ function buildUpstreamHeaders(req, url, headersParam) {
         }
     }
 
+    // CRITICAL: Inject cookies extracted from the query parameters if they exist
+    if (passedCookies) {
+        headers['cookie'] = headers['cookie'] 
+            ? `${headers['cookie']}; ${passedCookies}` 
+            : passedCookies;
+    }
+
     return headers;
 }
 
@@ -103,13 +103,15 @@ function setCorsHeaders(req, res) {
     res.setHeader('X-Content-Type-Options', 'nosniff');
 }
 
-function generateProxyUrl(targetUrl, headersParam) {
+// Fixed to dynamically attach routing session tokens inside child segments
+function generateProxyUrl(targetUrl, headersParam, sessionCookies) {
     let proxyUrl = `/m3u8-proxy?url=${encodeURIComponent(targetUrl)}`;
     if (headersParam) proxyUrl += `&headers=${encodeURIComponent(headersParam)}`;
+    if (sessionCookies) proxyUrl += `&_cookies=${encodeURIComponent(sessionCookies)}`;
     return proxyUrl;
 }
 
-function proxyPlaylistContent(content, url, headersParam) {
+function proxyPlaylistContent(content, url, headersParam, sessionCookies) {
     return content.split("\n").map((line) => {
         const trimmed = line.trim();
         if (trimmed === '' || trimmed.startsWith("#EXTM3U") || trimmed.startsWith("#EXT-X-VERSION")) {
@@ -119,7 +121,7 @@ function proxyPlaylistContent(content, url, headersParam) {
             return line.replace(/(URI\s*=\s*")([^"]+)(")/gi, (match, prefix, uri, suffix) => {
                 try {
                     const abs = new URL(uri, url.href).href;
-                    return `${prefix}${generateProxyUrl(abs, headersParam)}${suffix}`;
+                    return `${prefix}${generateProxyUrl(abs, headersParam, sessionCookies)}${suffix}`;
                 } catch (e) {
                     return match;
                 }
@@ -127,7 +129,7 @@ function proxyPlaylistContent(content, url, headersParam) {
         }
         try {
             const abs = new URL(trimmed, url.href).href;
-            return generateProxyUrl(abs, headersParam);
+            return generateProxyUrl(abs, headersParam, sessionCookies);
         } catch (e) {
             return line;
         }
@@ -159,14 +161,15 @@ app.get("/m3u8-proxy", async (req, res) => {
 
         const url = new URL(urlStr);
         const headersParam = req.query.headers ? decodeURIComponent(req.query.headers) : "";
-        const headers = buildUpstreamHeaders(req, url, headersParam);
+        const passedCookies = req.query._cookies ? decodeURIComponent(req.query._cookies) : "";
+        
+        const headers = buildUpstreamHeaders(req, url, headersParam, passedCookies);
 
         setCorsHeaders(req, res);
 
         const isPlaylist = url.pathname.toLowerCase().endsWith(".m3u8");
 
         if (isPlaylist) {
-            // Use Cloudscraper for .m3u8 to clear Cloudflare/Anti-Bot walls easily
             const options = {
                 method: 'GET',
                 url: url.href,
@@ -178,8 +181,20 @@ app.get("/m3u8-proxy", async (req, res) => {
 
             try {
                 const targetResponse = await cloudscraper(options);
+                
+                // Read and capture authentication cookies from the live playlist response
+                let sessionCookies = passedCookies || "";
+                const setCookie = targetResponse.headers['set-cookie'];
+                if (setCookie) {
+                    const parsed = Array.isArray(setCookie) ? setCookie : [setCookie];
+                    const extracted = parsed.map(c => c.split(';')[0]).join('; ');
+                    sessionCookies = sessionCookies ? `${sessionCookies}; ${extracted}` : extracted;
+                }
+
                 const content = targetResponse.body.toString('utf8');
-                const proxiedContent = proxyPlaylistContent(content, url, headersParam);
+                // Pass captured cookies directly down to the rewritten lines inside the manifest
+                const proxiedContent = proxyPlaylistContent(content, url, headersParam, sessionCookies);
+                
                 res.setHeader('Content-Type', "application/vnd.apple.mpegurl");
                 res.status(200).send(proxiedContent);
             } catch (err) {
@@ -187,17 +202,12 @@ app.get("/m3u8-proxy", async (req, res) => {
             }
             
         } else {
-            // Stream the media segments to bypass Vercel's 4.5MB limit
-            // Inject precise browser security parameters to completely clear 403 blocks
+            // Media segments, chunk streaming, and decryption keys (.key / .jpg)
             const proxyRequest = https.get(url.href, { 
                 headers, 
                 rejectUnauthorized: false 
             }, (targetResponse) => {
                 
-                if (targetResponse.statusCode === 403) {
-                    console.error("[403 Forbidden Detected]: Upstream rejected segment request.");
-                }
-
                 if (targetResponse.statusCode >= 400) {
                     return safeSend(targetResponse.statusCode, { 
                         message: `Upstream error status: ${targetResponse.statusCode}` 
